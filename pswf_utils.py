@@ -2,28 +2,63 @@ import torch
 import math
 
 def pswf_project(x, pswf_basis):
-    """
-    Project input x onto pswf_basis
-    x: (batch, seq_len, dim)
-    pswf_basis: (dim, compressed_dim)
-    """
-    # Apply the PSWF projection on the last dimension (features)
+    """Project input onto PSWF basis"""
+    if pswf_basis.device != x.device:
+        pswf_basis = pswf_basis.to(x.device)
+
+    # Project onto basis
     return torch.matmul(x, pswf_basis)
 
-# Build fixed PSWF basis
+def pswf_backproject(x, pswf_inverse):
+    """
+    Project back from compressed space to original space
+    x: (batch, compressed_dim)
+    pswf_inverse: (compressed_dim, dim) - should be transposed if needed
+    """
+    # Check if dimensions are correct
+    if pswf_inverse.shape[0] != x.shape[1]:
+        # Transpose the inverse matrix if it's in the wrong orientation
+        pswf_inverse = pswf_inverse.T
+
+    # Ensure x is on the correct device
+    if pswf_inverse.device != x.device:
+        pswf_inverse = pswf_inverse.to(x.device)
+
+    # Back-project via matrix multiplication
+    return torch.matmul(x, pswf_inverse)
+
 def build_pswf_basis(N, compressed_dim, bandwidth=math.pi):
+    """Build PSWF basis for projection and back-projection"""
+    # Input validation
+    assert compressed_dim <= N, f"Compressed dimension {compressed_dim} cannot exceed original dimension {N}"
+    if compressed_dim == N:
+        # Return identity matrices for no compression
+        return torch.eye(N), torch.eye(N)
+
+    # Create discretization grid
     x = torch.linspace(-1, 1, N)
     dx = x[1] - x[0]
+
+    # Build kernel matrix
     X, Y = torch.meshgrid(x, x, indexing='ij')
     kernel = torch.sinc(bandwidth * (X - Y) / math.pi) * dx
+
+    # Compute eigendecomposition
     eigenvalues, eigenvectors = torch.linalg.eigh(kernel)
+
+    # Sort by decreasing eigenvalue
     idx = torch.argsort(eigenvalues, descending=True)
-    basis = eigenvectors[:, idx][:, :compressed_dim]  # (N, compressed_dim)
+    eigenvalues = eigenvalues[idx]
+    eigenvectors = eigenvectors[:, idx]
 
-    # Precompute pseudo-inverse for backprojection
-    basis_pinv = torch.linalg.pinv(basis)  # (compressed_dim, N)
+    # Select top eigenvectors for basis
+    basis = eigenvectors[:, :compressed_dim]  # [N, compressed_dim]
 
-    return basis, basis_pinv
+    # Compute pseudo-inverse for back-projection
+    # The pseudo-inverse should be [compressed_dim, N] for backprojection
+    pseudo_inverse = torch.linalg.pinv(basis)  # This will give [compressed_dim, N]
+
+    return basis, pseudo_inverse
 
 # Make sure to define this first
 def create_pswf_functions(input_dim, compressed_dim, bandwidth=math.pi):

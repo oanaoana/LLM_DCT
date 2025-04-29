@@ -1,6 +1,71 @@
 import torch
 import math
+import numpy as np
 import time
+import config
+import scipy.fft as fft
+
+def build_dct_basis(input_dim, output_dim):
+    """Build DCT basis for compression"""
+    # Create basis matrix
+    basis = np.zeros((input_dim, output_dim))
+
+    # Fill with DCT basis vectors
+    for k in range(output_dim):
+        if k == 0:
+            basis[:, k] = 1.0 / math.sqrt(input_dim)
+        else:
+            for n in range(input_dim):
+                basis[n, k] = math.sqrt(2.0 / input_dim) * math.cos(
+                    (math.pi * (2 * n + 1) * k) / (2 * input_dim)
+                )
+
+
+    # Convert to torch tensor
+    basis = torch.from_numpy(basis.astype(np.float32))
+
+    # DCT basis is orthogonal, so transpose is inverse
+    inverse = basis.T
+
+    return basis, inverse
+
+def construct_dct_basis(input_dim, output_dim):
+    """Build DCT basis for compression"""
+    # Create basis matrix
+    basis = np.zeros((input_dim, output_dim))
+
+    # Fill with DCT basis vectors
+    for k in range(output_dim):
+        if k == 0:
+            basis[:, k] = 1.0 / math.sqrt(input_dim)
+        else:
+            for n in range(input_dim):
+                basis[n, k] = math.sqrt(2.0 / input_dim) * math.cos(
+                    (math.pi * (2 * n + 1) * k) / (2 * input_dim)
+                )
+
+
+    # Convert to torch tensor
+    basis = torch.from_numpy(basis.astype(np.float32))
+
+    # DCT basis is orthogonal, so transpose is inverse
+    inverse = basis.T
+
+    return basis, inverse
+
+def dct_project(x, dct_basis):
+    """Project input onto DCT basis"""
+    if dct_basis.device != x.device:
+        dct_basis = dct_basis.to(x.device)
+
+    return dct_fft(x,-1,"ortho")#torch.matmul(x, dct_basis)
+
+def dct_backproject(x, dct_inverse):
+    """Project back from DCT basis"""
+    if dct_inverse.device != x.device:
+        dct_inverse = dct_inverse.to(x.device)
+
+    return idct_fft(x,-1,"ortho")#torch.matmul(x, dct_inverse)
 
 def get_available_device():
     """
@@ -33,107 +98,128 @@ def dct_op(N, dtype=torch.float32, device=None):
 def idct_op(N, dtype=torch.float32, device=None):
     if device is None:
         device = get_available_device()
-    #matrix = torch.zeros((N, N), dtype=dtype, device=device)
-    #for i in range(N):
-    #    for j in range(N):
-    #        matrix[j, i] = math.sqrt(2 / N) * math.cos(math.pi * i * (2 * j + 1) / (2 * N))
-    #        if i == 0:
-    #            matrix[j, i] *= math.sqrt(2)/2
-    #return matrix
     dct_matrix = dct_op(N, dtype, device)
     dct_matrix = dct_matrix.T
     ##dct_matrix[0, :] *= math.sqrt(2)
     return dct_matrix
 
+def dct_vii_op(N, dtype=torch.float32, device=None):
+    if device is None:
+        device = get_available_device()
+    if N <= 0:
+        raise ValueError("N must be a positive integer.")
+
+    matrix = torch.zeros((N, N), dtype=dtype, device=device)
+    for i in range(N):
+        for j in range(N):
+            theta = math.pi * (i + 0.25) * (j + 0.25) / N
+            matrix[i, j] = math.sqrt(2 / N) * math.cos(theta)
+    return matrix
+
+def dct_viii_op(N, dtype=torch.float32, device=None):
+    if device is None:
+        device = get_available_device()
+    if N <= 0:
+        raise ValueError("N must be a positive integer.")
+
+    matrix = torch.zeros((N, N), dtype=dtype, device=device)
+    for i in range(N):
+        for j in range(N):
+            theta = math.pi * (i + 0.75) * (j + 0.75) / N
+            matrix[i, j] = math.sqrt(2 / N) * math.cos(theta)
+    return matrix
+
+def mdct_op(N, dtype=torch.float32, device=None):
+    if device is None:
+        device = get_available_device()
+    if N <= 0:
+        raise ValueError("N must be a positive integer.")
+
+    matrix = torch.zeros((N, 2 * N), dtype=dtype, device=device)
+    for k in range(N):
+        for n in range(2 * N):
+            angle = math.pi / N * (n + 0.5 + N / 2) * (k + 0.5)
+            matrix[k, n] = math.sqrt(1 / N) * math.cos(angle)
+    return matrix
+
 # Add a cache for DCT matrices
 dct_matrix_cache = {}
 idct_matrix_cache = {}
 
-def get_dct_matrix(N, dtype=torch.float32, device=None):
-    """Get DCT matrix from cache or compute it."""
-    if device is None:
-        device = get_available_device()
-
-    key = (N, dtype, str(device))
-    if key not in dct_matrix_cache:
-        dct_matrix_cache[key] = dct_op(N, dtype, device)
-    return dct_matrix_cache[key]
-
-def get_idct_matrix(N, dtype=torch.float32, device=None):
-    """Get IDCT matrix from cache or compute it."""
-    if device is None:
-        device = get_available_device()
-
-    key = (N, dtype, str(device))
-    if key not in idct_matrix_cache:
-        idct_matrix_cache[key] = idct_op(N, dtype, device)
-    return idct_matrix_cache[key]
-
-def apply_dct(x, method='operator', norm='ortho'):
+def get_dct_matrix(config):
     """
-    Apply Discrete Cosine Transform to input data using specified method.
+    Get DCT matrix from cache or compute it.
 
     Args:
-        x (torch.Tensor): Input tensor (vector or matrix)
-        method (str): Method to use: 'operator' or 'fft'
-        norm (str): Normalization method ('ortho' for orthonormal)
+        N (int): Size of the DCT matrix.
+        dtype (torch.dtype): Data type of the matrix.
+        device (torch.device): Device to store the matrix.
+        dct_type (str): Type of DCT to use ('default', 'vii', 'viii').
 
     Returns:
-        torch.Tensor: DCT transformed data
+        torch.Tensor: The DCT matrix.
     """
-    orig_shape = x.shape
+    N = config.block_size
+    dtype = config.dtype if hasattr(config, 'dtype') else torch.float32
+    device = config.device if hasattr(config, 'device') else get_available_device()
+    dct_type = config.dct_type
 
-    # For matrices or higher-dimensional tensors, apply DCT to the last dimension
-    if len(orig_shape) > 1:
-        # Reshape to treat last dimension separately
-        x_reshaped = x.reshape(-1, orig_shape[-1])
-        result = []
-
-        # Process each vector along the last dimension
-        for i in range(x_reshaped.shape[0]):
-            vector = x_reshaped[i]
-            # Apply the selected DCT method
-            if method == 'operator':
-                dct_result = apply_operator_dct(vector, norm)
-            elif method == 'fft':
-                dct_result = dct_fft(vector, norm)
-            else:
-                raise ValueError(f"Unknown method: {method}. Use 'operator' or 'fft'.")
-
-            result.append(dct_result)
-
-        # Combine results and reshape back to original dimensions
-        return torch.stack(result).reshape(orig_shape)
-    else:
-        # Vector case
-        if method == 'operator':
-            return apply_operator_dct(x, norm)
-        elif method == 'fft':
-            return dct_fft(x, norm)
+    key = (N, dtype, str(device), dct_type)
+    if key not in dct_matrix_cache:
+        if dct_type == 'default':
+            dct_matrix_cache[key] = dct_op(N, dtype, device)
+        elif dct_type == 'vii':
+            dct_matrix_cache[key] = dct_vii_op(N, dtype, device)
+        elif dct_type == 'viii':
+            dct_matrix_cache[key] = dct_viii_op(N, dtype, device)
         else:
-            raise ValueError(f"Unknown method: {method}. Use 'operator' or 'fft'.")
+            raise ValueError(f"Unsupported DCT type: {dct_type}")
+    return dct_matrix_cache[key]
 
-def apply_operator_dct_efficient(x, direction='forward'):
+def get_idct_matrix(config):
+    """Get IDCT matrix from cache or compute it."""
+    N = config.block_size
+    dtype = config.dtype if hasattr(config, 'dtype') else torch.float32
+    device = config.device if hasattr(config, 'device') else get_available_device()
+    dct_type = config.dct_type
+
+    key = (N, dtype, str(device), dct_type)
+    if key not in idct_matrix_cache:
+        if dct_type == 'default':
+            idct_matrix_cache[key] = idct_op(N, dtype, device)
+        elif dct_type == 'vii':
+            idct_matrix_cache[key] = dct_vii_op(N, dtype, device).T
+        elif dct_type == 'viii':
+            idct_matrix_cache[key] = dct_viii_op(N, dtype, device).T
+        else:
+            raise ValueError(f"Unsupported DCT type: {dct_type}")
+    return idct_matrix_cache[key]
+
+def apply_operator_dct(x, config, direction='forward'):
     """
     Efficiently apply DCT or IDCT using the matrix operator approach.
     Computes dct_matrix * x * dct_matrix.T for 2D matrices or dct_matrix * x for 1D vectors.
 
     Args:
         x (torch.Tensor): Input tensor (1D vector or 2D matrix).
-        norm (str): Normalization method ('ortho' for orthonormal).
         direction (str): 'forward' for DCT, 'inverse' for IDCT.
+        dct_type (str): Type of DCT to use ('default', 'vii', 'viii').
 
     Returns:
         torch.Tensor: Transformed data (DCT or IDCT).
     """
+    if config is None:
+        raise ValueError("A valid configuration object (config) must be provided.")
     if direction not in ['forward', 'inverse']:
         raise ValueError("Invalid direction. Use 'forward' for DCT or 'inverse' for IDCT.")
+    if config.dct_type not in ['default', 'vii', 'viii']:
+        raise ValueError("Invalid DCT type. Use 'default', 'vii', or 'viii'.")
 
-    # Choose the appropriate matrix based on the direction
+    # Choose the appropriate matrix based on the direction and DCT type
     if direction == 'forward':
-        transform_matrix = get_dct_matrix(x.size(-1), dtype=x.dtype, device=x.device)
+        transform_matrix = get_dct_matrix(config)
     else:  # direction == 'inverse'
-        transform_matrix = get_idct_matrix(x.size(-1), dtype=x.dtype, device=x.device)
+        transform_matrix = get_idct_matrix(config)
 
     if len(x.shape) == 2:
         # 2D case: Apply transform to rows and columns
@@ -144,7 +230,7 @@ def apply_operator_dct_efficient(x, direction='forward'):
     else:
         raise ValueError("Input must be a 1D vector or 2D matrix.")
 
-def truncate_operator_dct(x, max_freqs):
+def truncate_operator_dct(x, config):
     """
     Truncate the input in DCT space by retaining only the first `max_freqs` frequencies.
 
@@ -157,11 +243,14 @@ def truncate_operator_dct(x, max_freqs):
     Returns:
         torch.Tensor: Truncated input in the original domain.
     """
+    max_freqs = config.max_freqs
+    dct_type = config.dct_type
+
     if max_freqs <= 0 or max_freqs > x.flatten().size(-1):
         raise ValueError(f"max_freqs must be in the range [1, {x.size(-1)}], got {max_freqs}.")
 
     # Apply DCT to the input
-    x_dct = apply_operator_dct_efficient(x, direction='forward')
+    x_dct = apply_operator_dct(x, config, direction='forward')
 
     # Truncate the DCT coefficients
     if len(x.shape) == 2:  # 2D case
@@ -171,21 +260,21 @@ def truncate_operator_dct(x, max_freqs):
         truncated_dct_flat = x_dct.flatten()
         truncated_dct_flat[sorted_indices[max_freqs:]] = 0
         truncated_dct = truncated_dct_flat.reshape(x_dct.shape)
-        print(f"Transformed DCT vector: {x_dct.round(decimals=4)}")
-        print(f"Truncated DCT vector: {truncated_dct.round(decimals=4)}")
+        #print(f"Transformed DCT vector: {x_dct.round(decimals=4)}")
+        #print(f"Truncated DCT vector: {truncated_dct.round(decimals=4)}")
     elif len(x.shape) == 1:  # 1D case
         truncated_dct = torch.zeros_like(x_dct)
         x_dct_sort, indices = torch.sort(torch.abs(x_dct), descending=True)
         truncated_dct = x_dct.clone()
         truncated_dct[indices[max_freqs:]] = 0
         #truncated_dct[:max_freqs] = x_dct[:max_freqs]
-        print(f"Transformed DCT vector: {x_dct}")
-        print(f"Truncated DCT vector: {truncated_dct}")
+        #print(f"Transformed DCT vector: {x_dct}")
+        #print(f"Truncated DCT vector: {truncated_dct}")
     else:
         raise ValueError("Input must be a 1D vector or 2D matrix.")
 
     # Apply inverse DCT to reconstruct the truncated input
-    x_truncated = apply_operator_dct_efficient(truncated_dct, direction='inverse')
+    x_truncated = apply_operator_dct(truncated_dct, config, direction='inverse')
 
     return x_truncated
 
@@ -265,108 +354,63 @@ def truncate_fft_dct_sort(x, max_freqs, norm='ortho'):
 
     return x_truncated
 
-def apply_idct(x, method='operator', norm='ortho'):
-    """
-    Apply Inverse Discrete Cosine Transform using specified method.
+def dct_fft(src, dim=-1, norm='ortho'):
+    # type: (torch.tensor, int, str) -> torch.tensor
 
-    Args:
-        x (torch.Tensor): Input tensor in DCT domain
-        method (str): Method to use: 'operator' or 'fft'
-        norm (str): Normalization method
+    x = src.clone()
+    N = x.shape[dim]
 
-    Returns:
-        torch.Tensor: Reconstructed data in spatial domain
-    """
-    orig_shape = x.shape
+    x = x.transpose(dim, -1)
+    x_shape = x.shape
+    x = x.contiguous().view(-1, N)
 
-    # For matrices or higher-dimensional tensors, apply IDCT to the last dimension
-    if len(orig_shape) > 1:
-        # Reshape to treat last dimension separately
-        x_reshaped = x.reshape(-1, orig_shape[-1])
-        result = []
+    v = torch.empty_like(x, device=x.device)
+    v[..., :(N - 1) // 2 + 1] = x[..., ::2]
 
-        # Process each vector along the last dimension
-        for i in range(x_reshaped.shape[0]):
-            vector = x_reshaped[i]
-            # Apply the selected IDCT method
-            if method == 'operator':
-                idct_result = apply_operator_idct(vector, norm)
-            elif method == 'fft':
-                idct_result = idct_fft(vector, norm)
-            else:
-                raise ValueError(f"Unknown method: {method}. Use 'operator' or 'fft'.")
+    if N % 2:  # odd length
+        v[..., (N - 1) // 2 + 1:] = x.flip(-1)[..., 1::2]
+    else:  # even length
+        v[..., (N - 1) // 2 + 1:] = x.flip(-1)[..., ::2]
 
-            result.append(idct_result)
+    V = torch.fft.fft(v, dim=-1)
 
-        # Combine results and reshape back to original dimensions
-        return torch.stack(result).reshape(orig_shape)
-    else:
-        # Vector case
-        if method == 'operator':
-            return apply_operator_idct(x, norm)
-        elif method == 'fft':
-            return idct_fft(x, norm)
-        else:
-            raise ValueError(f"Unknown method: {method}. Use 'operator' or 'fft'.")
-
-def apply_operator_idct(x, norm='ortho'):
-    """
-    Apply IDCT using the matrix operator approach.
-
-    Args:
-        x (torch.Tensor): Input vector in DCT domain
-        norm (str): Normalization method
-
-    Returns:
-        torch.Tensor: Reconstructed vector in spatial domain
-    """
-    # Create IDCT matrix
-    idct_matrix = idct_op(x.size(-1), dtype=x.dtype, device=x.device)
-
-    # Apply transformation
-    return torch.matmul(idct_matrix, x)
-
-def dct_fft(x, norm='ortho'):
-    orig_dtype = x.dtype
-    orig_device = x.device
-    x = x.to(dtype=torch.float32, device=orig_device)
-
-    N = x.size(-1)
-    v = torch.cat([x, x.flip(dims=[-1])], dim=-1)
-    Vc = torch.fft.fft(v, dim=-1)
-    k = torch.arange(N, device=orig_device)
-    factor = -1j * math.pi * k / (2 * N)
-    W = torch.exp(factor).unsqueeze(0).to(orig_device)
-    X = (Vc[..., :N] * W).real
+    k = torch.arange(N, device=x.device)
+    V = 2 * V * torch.exp(-1j * np.pi * k / (2 * N))
 
     if norm == 'ortho':
-        X[..., 0] = X[..., 0] * math.sqrt(2)/2
-        X = X * math.sqrt(2 /  N)
-    else:
-        X = X / 2
+        V[..., 0] *= math.sqrt(1/(4*N))
+        V[..., 1:] *= math.sqrt(1/(2*N))
 
-    return X.to(dtype=orig_dtype)
+    V = V.real
+    V = V.view(*x_shape).transpose(-1, dim)
 
-def idct_fft(X, norm='ortho'):
-    orig_dtype = X.dtype
-    orig_device = X.device
-    X = X.to(dtype=torch.float32, device=orig_device)
+    return V
 
-    N = X.size(-1)
-    X0 = X[..., 0].unsqueeze(-1)
+def idct_fft(src, dim=-1, norm='ortho'):
+    # type: (torch.tensor, int, str) -> torch.tensor
+
+    X = src.clone()
+    N = X.shape[dim]
+
+    X = X.transpose(dim, -1)
+    X_shape = X.shape
+    X = X.contiguous().view(-1, N)
 
     if norm == 'ortho':
-        X0 = X0 * math.sqrt(2)/2
-        X = X * math.sqrt(2 / N)
+        X[..., 0] *= 1 / math.sqrt(2)
+        X *= N*math.sqrt((2 / N))
+    else:
+        raise Exception("idct with norm=None is buggy A.F")
 
-    X = torch.cat([X0, X[..., 1:]], dim=-1)
-    V = torch.zeros(X.size(0), 2 * N, device=orig_device, dtype=torch.complex64)
-    k = torch.arange(N, device=orig_device)
-    factor = 1j * math.pi * k / (2 * N)
-    W = torch.exp(factor).unsqueeze(0).to(orig_device)
-    V[..., :N] = X * W
-    flipped_conj = torch.conj(V[..., 1:N].flip(dims=[-1]))
-    V[..., -N + 1:] = flipped_conj
+    k = torch.arange(N, device=X.device)
 
-    v = torch.fft.ifft(V, dim=-1).real
-    return v[..., :N].to(dtype=orig_dtype)
+    X = X * torch.exp(1j * np.pi * k / (2 * N))
+    X = torch.fft.ifft(X, dim=-1).real
+    v = torch.empty_like(X, device=X.device)
+
+    v[..., ::2] = X[..., :(N - 1) // 2 + 1]
+    v[..., 1::2] = X[..., (N - 1) // 2 + 1:].flip(-1)
+
+    v = v.view(*X_shape).transpose(-1, dim)
+
+    return v

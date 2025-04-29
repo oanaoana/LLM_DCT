@@ -3,3 +3,4 @@ peft
 accelerate
 bitsandbytes
 huggingface_hub
+nltk

@@ -4,6 +4,7 @@ import time
 from transformers import GPT2LMHeadModel, GPT2Tokenizer
 import llm_pswf
 import pswf_utils as pswf
+import dct_utils as dct  # Add this import
 
 def warmup_device(device='cpu'):
     """
@@ -73,9 +74,9 @@ def main():
      # 3. Run comparison tests
     test_prompts = [
         "Once upon a time,",
-        "The quick brown fox",
-        "In a galaxy far far away,",
-        "The meaning of life is"
+        #"The quick brown fox",
+        #"In a galaxy far far away,",
+        #"The meaning of life is"
     ]
 
     print("=== Comparison of Original vs Sparsified Model ===\n")
@@ -118,30 +119,40 @@ def main():
         head_dim = hidden_size // num_heads  # 64 for GPT2-small
 
         # Calculate compression that maintains head compatibility
-        compression_ratio = 1.0  # compress to 50%
+        compression_ratio = 0.5  # compress to 50%
         compressed_dim = int(hidden_size * compression_ratio)
         # Ensure compressed_dim is divisible by num_heads
         compressed_dim = (compressed_dim // num_heads) * num_heads
-        compressed_dim = hidden_size
+        #compressed_dim = hidden_size
         print(f"Using compressed dimension: {compressed_dim} (original: {hidden_size})")
 
         # Build the PSWF basis
         pswf_basis, pswf_inverse = pswf.build_pswf_basis(hidden_size, compressed_dim)
 
         # Define which layers to patch (without comma at the end of each line!)
-        layers_to_patch = None #[0]  # Only first 6 layers
+        layers_to_patch = [0]  # Only first 6 layers
 
         # Define sparsification functions (without commas at the end!)
         #sparsify_q_fn = lambda x: pswf.pswf_project(x, pswf_basis)
         #sparsify_k_fn = lambda x: pswf.pswf_project(x, pswf_basis)
         #sparsify_v_fn = lambda x: pswf.pswf_project(x, pswf_basis)
-        #backproject_fn = lambda x: pswf.pswf_project(x, pswf_inverse)
+        #backproject_fn = lambda x: pswf.pswf_backproject(x, pswf_inverse)
+
+        # Build the DCT basis instead of PSWF
+        dct_basis, dct_inverse = dct.build_dct_basis(hidden_size, compressed_dim)
+        print(dct_basis)
+
+        # Define sparsification functions
+        sparsify_q_fn = lambda x: dct.dct_project(x, dct_basis)
+        sparsify_k_fn = lambda x: dct.dct_project(x, dct_basis)
+        sparsify_v_fn = lambda x: dct.dct_project(x, dct_basis)
+        backproject_fn = lambda x: dct.dct_backproject(x, dct_inverse)
 
         # In main_pswf_perf.py, replace your sparsification functions with these for testing:
-        sparsify_q_fn = lambda x: x#[:, :compressed_dim]  # Simple truncation
-        sparsify_k_fn = lambda x: x#[:, :compressed_dim]  # Simple truncation
-        sparsify_v_fn = lambda x: x#[:, :compressed_dim]  # Simple truncation
-        backproject_fn = lambda x: x#torch.cat([x, torch.zeros(x.size(0), original_dim-compressed_dim, device=x.device)], dim=1)  # Pad with zeros
+        #sparsify_q_fn = lambda x: x#[:, :compressed_dim]  # Simple truncation
+        #sparsify_k_fn = lambda x: x#[:, :compressed_dim]  # Simple truncation
+        #sparsify_v_fn = lambda x: x#[:, :compressed_dim]  # Simple truncation
+        #backproject_fn = lambda x: x#torch.cat([x, torch.zeros(x.size(0), original_dim-compressed_dim, device=x.device)], dim=1)  # Pad with zeros
 
         # Apply attention sparsification
         sparsified_model = llm_pswf.apply_attention_sparsification(
@@ -340,6 +351,8 @@ def debug_attention_implementation():
     print(f"Original: {original_text}")
     print(f"Patched:  {patched_text}")
     print(f"Match: {'YES' if original_text == patched_text else 'NO'}")
+    # Add this call to your debug function
+    check_pswf_projection(768, 684)
 
 def generate_text(model, tokenizer, prompt, max_new_tokens=50, do_sample=True, temperature=0.7, device="cuda"):
     """
@@ -376,6 +389,57 @@ def generate_text(model, tokenizer, prompt, max_new_tokens=50, do_sample=True, t
 
     # Decode and return
     return tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+def check_pswf_projection(hidden_size=768, compressed_dim=684):
+    """Check if PSWF projection is working correctly"""
+    print("\n=== Checking PSWF Projection ===")
+
+    # Create random test data
+    torch.manual_seed(42)  # For reproducibility
+    test_data = torch.randn(4, 8, hidden_size)  # [batch, seq, hidden]
+    print(f"Original data shape: {test_data.shape}")
+
+    # Build PSWF basis
+    pswf_basis, pswf_inverse = pswf.build_pswf_basis(hidden_size, compressed_dim)
+    print(f"PSWF basis shape: {pswf_basis.shape}")
+    print(f"PSWF inverse shape: {pswf_inverse.shape}")
+
+    # Check that dimensions are compatible
+    print(f"Basis inner dimension check: {pswf_basis.shape[1] == pswf_inverse.shape[0]}")
+    print(f"Project: [{hidden_size}] -> [{compressed_dim}]")
+    print(f"Backproject: [{compressed_dim}] -> [{hidden_size}]")
+
+    # Flatten for projection
+    test_flat = test_data.reshape(-1, hidden_size)
+    print(f"Flattened data shape: {test_flat.shape}")
+
+    # Project
+    projected = pswf.pswf_project(test_flat, pswf_basis)
+    print(f"Projected data shape: {projected.shape}")
+
+    # Backproject
+    backprojected = pswf.pswf_backproject(projected, pswf_inverse)
+    print(f"Backprojected data shape: {backprojected.shape}")
+
+    # Reshape back
+    reshaped = projected.reshape(4, 8, -1)
+    print(f"Reshaped data shape: {reshaped.shape}")
+
+    # Calculate compression ratio
+    actual_compression = reshaped.size(-1) / test_data.size(-1)
+    print(f"Actual compression ratio: {actual_compression:.4f}")
+
+    # Calculate reconstruction error
+    reconstruction_error = (test_flat - backprojected).abs().mean().item()
+    print(f"Reconstruction error: {reconstruction_error:.8f}")
+
+    # Test if backprojects correctly
+    if torch.allclose(test_flat, backprojected, atol=1e-5):
+        print("✅ PSWF projection and backprojection working correctly!")
+    else:
+        print("❌ PSWF reconstruction has errors!")
+        print(f"   Min error: {(test_flat - backprojected).abs().min().item():.8f}")
+        print(f"   Max error: {(test_flat - backprojected).abs().max().item():.8f}")
 
 # Add this call at the beginning of your main() function
 debug_attention_implementation()
