@@ -122,6 +122,7 @@ def main():
         compressed_dim = int(hidden_size * compression_ratio)
         # Ensure compressed_dim is divisible by num_heads
         compressed_dim = (compressed_dim // num_heads) * num_heads
+        compressed_dim = hidden_size
         print(f"Using compressed dimension: {compressed_dim} (original: {hidden_size})")
 
         # Build the PSWF basis
@@ -131,10 +132,16 @@ def main():
         layers_to_patch = None #[0]  # Only first 6 layers
 
         # Define sparsification functions (without commas at the end!)
-        sparsify_q_fn = lambda x: pswf.pswf_project(x, pswf_basis)
-        sparsify_k_fn = lambda x: pswf.pswf_project(x, pswf_basis)
-        sparsify_v_fn = lambda x: pswf.pswf_project(x, pswf_basis)
-        backproject_fn = lambda x: pswf.pswf_project(x, pswf_inverse)
+        #sparsify_q_fn = lambda x: pswf.pswf_project(x, pswf_basis)
+        #sparsify_k_fn = lambda x: pswf.pswf_project(x, pswf_basis)
+        #sparsify_v_fn = lambda x: pswf.pswf_project(x, pswf_basis)
+        #backproject_fn = lambda x: pswf.pswf_project(x, pswf_inverse)
+
+        # In main_pswf_perf.py, replace your sparsification functions with these for testing:
+        sparsify_q_fn = lambda x: x#[:, :compressed_dim]  # Simple truncation
+        sparsify_k_fn = lambda x: x#[:, :compressed_dim]  # Simple truncation
+        sparsify_v_fn = lambda x: x#[:, :compressed_dim]  # Simple truncation
+        backproject_fn = lambda x: x#torch.cat([x, torch.zeros(x.size(0), original_dim-compressed_dim, device=x.device)], dim=1)  # Pad with zeros
 
         # Apply attention sparsification
         sparsified_model = llm_pswf.apply_attention_sparsification(
@@ -232,6 +239,146 @@ def main():
     except Exception as e:
         print(f"Error in BLEU calculation: {str(e)}")
         print("If using NLTK, install with: pip install nltk")
+
+def debug_attention_implementation():
+    """Debug the attention patching implementation"""
+    print("\n=== DEBUGGING ATTENTION IMPLEMENTATION ===")
+
+    # Load models
+    model_name = "gpt2"
+    tokenizer = GPT2Tokenizer.from_pretrained(model_name)
+    tokenizer.pad_token = tokenizer.eos_token  # Set pad token
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Original model
+    print("Setting up original model...")
+    original_model = GPT2LMHeadModel.from_pretrained(model_name)
+    original_model.to(device)
+    original_model.eval()
+
+    # Identity function
+    identity_fn = lambda x: x
+
+    # Create patched model with identity functions but no compression
+    print("Creating patched model with identity functions...")
+    patched_model = GPT2LMHeadModel.from_pretrained(model_name)
+    patched_model.to(device)
+    patched_model = llm_pswf.apply_attention_sparsification(
+        patched_model,
+        sparsify_q_fn=identity_fn,
+        sparsify_k_fn=identity_fn,
+        sparsify_v_fn=identity_fn,
+        compressed_dim=None,  # No compression
+        layers_to_patch=None,  # Patch all layers
+        backproject_fn=None    # No backprojection needed
+    )
+    patched_model.eval()
+
+    # Run basic forward pass comparison
+    print("\nComparing forward pass outputs...")
+    prompt = "Hello, world!"
+    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+
+    # Set consistent seed
+    torch.manual_seed(42)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(42)
+
+    with torch.no_grad():
+        original_outputs = original_model(**inputs)
+        original_logits = original_outputs.logits
+
+    # Reset seed
+    torch.manual_seed(42)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(42)
+
+    with torch.no_grad():
+        patched_outputs = patched_model(**inputs)
+        patched_logits = patched_outputs.logits
+
+    # Compare logits
+    diff = (original_logits - patched_logits).abs()
+    max_diff = diff.max().item()
+    avg_diff = diff.mean().item()
+
+    print(f"Max logits difference: {max_diff:.8f}")
+    print(f"Mean logits difference: {avg_diff:.8f}")
+
+    # Very detailed comparison - inspecting token probabilities
+    print("\nToken probability differences:")
+    for i in range(min(5, original_logits.size(1))):  # Check first few positions
+        orig_probs = torch.softmax(original_logits[0, i], dim=-1)
+        patch_probs = torch.softmax(patched_logits[0, i], dim=-1)
+
+        # Get top tokens
+        orig_top5 = torch.topk(orig_probs, 5)
+        patch_top5 = torch.topk(patch_probs, 5)
+
+        print(f"\nPosition {i} top tokens:")
+        print("Original:", [f"{tokenizer.decode([idx.item()])}:{prob:.4f}" for idx, prob in zip(orig_top5.indices, orig_top5.values)])
+        print("Patched: ", [f"{tokenizer.decode([idx.item()])}:{prob:.4f}" for idx, prob in zip(patch_top5.indices, patch_top5.values)])
+
+    # Test generation
+    print("\nTesting text generation...")
+    torch.manual_seed(42)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(42)
+
+    original_text = generate_text(
+        original_model, tokenizer, "Hello, world!", max_new_tokens=20, device=device.type
+    )
+
+    torch.manual_seed(42)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(42)
+
+    patched_text = generate_text(
+        patched_model, tokenizer, "Hello, world!", max_new_tokens=20, device=device.type
+    )
+
+    print(f"Original: {original_text}")
+    print(f"Patched:  {patched_text}")
+    print(f"Match: {'YES' if original_text == patched_text else 'NO'}")
+
+def generate_text(model, tokenizer, prompt, max_new_tokens=50, do_sample=True, temperature=0.7, device="cuda"):
+    """
+    Generate text from a model based on a prompt
+
+    Args:
+        model: The model to use for generation
+        tokenizer: The tokenizer for the model
+        prompt: The text prompt to start generation
+        max_new_tokens: Maximum number of new tokens to generate
+        do_sample: Whether to use sampling (vs greedy decoding)
+        temperature: Sampling temperature (higher = more random)
+        device: Device to use for generation
+
+    Returns:
+        The generated text including the prompt
+    """
+    # Tokenize input
+    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+
+    # Set pad token if not already set
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    # Generate
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=do_sample,
+            temperature=temperature,
+            pad_token_id=tokenizer.pad_token_id
+        )
+
+    # Decode and return
+    return tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+# Add this call at the beginning of your main() function
+debug_attention_implementation()
 
 if __name__ == "__main__":
     main()

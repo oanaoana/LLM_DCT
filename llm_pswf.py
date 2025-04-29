@@ -32,7 +32,7 @@ def sparse_dense_matmul(sparse, dense):
 
 # Patched attention implementation
 class PatchedCausalSelfAttention(torch.nn.Module):
-    def __init__(self, original_attn, sparsify_q_fn, sparsify_k_fn, sparsify_v_fn, backproject_fn=None, compressed_dim=None):
+    def __init__(self, original_attn, sparsify_q_fn, sparsify_k_fn, sparsify_v_fn, backproject_fn=None, compressed_dim=None, layers_to_patch=None):
         super().__init__()
         self.original_attn = original_attn
         self.sparsify_q_fn = sparsify_q_fn
@@ -40,36 +40,53 @@ class PatchedCausalSelfAttention(torch.nn.Module):
         self.sparsify_v_fn = sparsify_v_fn
         self.backproject_fn = backproject_fn
 
-        # Original embedding dimensions
-        self.orig_embed_dim = getattr(original_attn, 'embed_dim', original_attn.split_size)
+        # Get original dimensions
+        self.embed_dim = getattr(original_attn, 'embed_dim', getattr(original_attn, 'split_size', 768))
+        self.n_head = getattr(original_attn, 'n_head', getattr(original_attn, 'num_heads', 12))
+        self.head_dim = self.embed_dim // self.n_head
 
-        # Handle compression if specified
-        if compressed_dim is not None:
+        # For backward compatibility
+        self.num_heads = self.n_head
+        self.split_size = self.embed_dim
+
+        # Original dimensions for reference
+        self.orig_embed_dim = self.embed_dim
+        self.orig_head_dim = self.head_dim
+
+        # Track if we're using compression
+        self.using_compression = False
+
+        # Update dimensions if using compression
+        if compressed_dim is not None and compressed_dim != self.embed_dim:
+            self.using_compression = True
             self.embed_dim = compressed_dim
-            self.num_heads = original_attn.num_heads if hasattr(original_attn, 'num_heads') else original_attn.n_head
-            assert compressed_dim % self.num_heads == 0, "Compressed dimension must be divisible by number of heads"
-            self.head_dim = compressed_dim // self.num_heads
+            assert compressed_dim % self.n_head == 0, f"Compressed dimension {compressed_dim} must be divisible by {self.n_head} heads"
+            self.head_dim = compressed_dim // self.n_head
             self.split_size = compressed_dim
-            self.scale_attn = 1.0 / math.sqrt(self.head_dim)
 
-            # Check if we have a backprojection function
-            if self.backproject_fn is None:
-                print("WARNING: No backproject_fn provided with compressed_dim. Results may be incorrect.")
-        else:
-            # Fallback: no compression
-            self.embed_dim = self.orig_embed_dim
-            self.num_heads = getattr(original_attn, 'num_heads', original_attn.n_head)
-            self.head_dim = getattr(original_attn, 'head_dim', self.embed_dim // self.num_heads)
-            self.split_size = getattr(original_attn, 'split_size', self.embed_dim)
-            self.scale_attn = getattr(original_attn, 'scale_attn', 1.0 / math.sqrt(self.head_dim))
+            if self.backproject_fn is None and self.using_compression:
+                print("WARNING: Using compression without a backproject function!")
 
-        # Other parameters (caching, etc.)
-        self.is_causal = getattr(original_attn, 'is_causal', True)
+        # Copy other attributes from original attention
+        for name, attr in vars(original_attn).items():
+            if not name.startswith('_') and name not in ['c_attn', 'c_proj', 'attn_dropout', 'resid_dropout']:
+                setattr(self, name, attr)
 
-        # Copy all attributes from the original attention
-        for attr_name in dir(original_attn):
-            if not attr_name.startswith('_') and not hasattr(self, attr_name):
-                setattr(self, attr_name, getattr(original_attn, attr_name))
+    def _split_heads(self, tensor, num_heads, attn_head_size):
+        """
+        Splits hidden_size dim into attn_head_size and num_heads
+        """
+        new_shape = tensor.size()[:-1] + (num_heads, attn_head_size)
+        tensor = tensor.view(*new_shape)
+        return tensor.permute(0, 2, 1, 3)  # (batch, head, seq_length, head_features)
+
+    def _merge_heads(self, tensor, num_heads, attn_head_size):
+        """
+        Merges attn_head_size dim and num_attn_heads dim into hidden_size
+        """
+        tensor = tensor.permute(0, 2, 1, 3).contiguous()
+        new_shape = tensor.size()[:-2] + (num_heads * attn_head_size,)
+        return tensor.view(*new_shape)
 
     def forward(
         self,
@@ -82,118 +99,139 @@ class PatchedCausalSelfAttention(torch.nn.Module):
         use_cache=False,
         output_attentions=False,
     ):
-        # Get the original QKV projections
+        # Ensure precision matches exactly between implementations
+        dtype = hidden_states.dtype
+
+        # During generation, we'll get a single token at a time when layer_past is provided
+        is_generation_mode = layer_past is not None and hidden_states.shape[1] == 1
+
+        # Use original c_attn to project QKV
         qkv = self.original_attn.c_attn(hidden_states)
 
-        # Fix the split operation - GPT-2 concatenates q,k,v along dim 2
-        # The split size should be embedding_dim (not split_size which could be compressed_dim)
-        qkv_split = qkv.split(self.original_attn.embed_dim, dim=2)
+        # Split QKV - here's where GPT-2 splits into Q, K, V
+        qkv_size = qkv.size(-1)
+        query, key, value = qkv.split(qkv_size // 3, dim=2)
 
-        # If we got exactly 3 tensors, unpack them
-        if len(qkv_split) == 3:
-            query, key, value = qkv_split
+        # Get batch size and sequence length
+        batch_size, seq_length = hidden_states.shape[:2]
+
+        # Apply sparsification functions if they're callable
+        # IMPORTANT: Only apply sparsification if not in generation mode OR
+        # if both current and past key/values need to be sparsified consistently
+        if not is_generation_mode:
+            # Regular training/inference pass - apply sparsification to full sequence
+            query_flat = query.reshape(-1, query.size(-1))
+            key_flat = key.reshape(-1, key.size(-1))
+            value_flat = value.reshape(-1, value.size(-1))
+
+            query_flat = self.sparsify_q_fn(query_flat) if callable(self.sparsify_q_fn) else query_flat
+            key_flat = self.sparsify_k_fn(key_flat) if callable(self.sparsify_k_fn) else key_flat
+            value_flat = self.sparsify_v_fn(value_flat) if callable(self.sparsify_v_fn) else value_flat
+
+            query = query_flat.reshape(batch_size, seq_length, -1)
+            key = key_flat.reshape(batch_size, seq_length, -1)
+            value = value_flat.reshape(batch_size, seq_length, -1)
         else:
-            # Otherwise, the original model might have a different pattern
-            # Let's try the most common GPT-2 pattern
-            qkv_size = qkv.size(-1)
-            query, key, value = qkv.split(qkv_size // 3, dim=2)
+            # Generation mode with cached key/values
+            # In this case, we need to handle sparsification carefully
+            if callable(self.sparsify_q_fn):
+                query_flat = query.reshape(-1, query.size(-1))
+                query_flat = self.sparsify_q_fn(query_flat)
+                query = query_flat.reshape(batch_size, seq_length, -1)
 
-        # Type safety check for sparsification functions
-        if not callable(self.sparsify_q_fn):
-            print(f"WARNING: sparsify_q_fn is not callable, it's {type(self.sparsify_q_fn)}. Using identity function.")
-            query = query  # No change
-        else:
-            query = self.sparsify_q_fn(query)
+            if layer_past is not None:
+                # If using cached key/values, apply sparsification only to the new token
+                # and ensure past key/values were already sparsified consistently
+                past_key, past_value = layer_past
 
-        if not callable(self.sparsify_k_fn):
-            print(f"WARNING: sparsify_k_fn is not callable, it's {type(self.sparsify_k_fn)}. Using identity function.")
-            key = key  # No change
-        else:
-            key = self.sparsify_k_fn(key)
+                # Only sparsify new key/value tokens before concatenating
+                if callable(self.sparsify_k_fn):
+                    key_flat = key.reshape(-1, key.size(-1))
+                    key_flat = self.sparsify_k_fn(key_flat)
+                    key = key_flat.reshape(batch_size, seq_length, -1)
 
-        if not callable(self.sparsify_v_fn):
-            print(f"WARNING: sparsify_v_fn is not callable, it's {type(self.sparsify_v_fn)}. Using identity function.")
-            value = value  # No change
-        else:
-            value = self.sparsify_v_fn(value)
+                if callable(self.sparsify_v_fn):
+                    value_flat = value.reshape(-1, value.size(-1))
+                    value_flat = self.sparsify_v_fn(value_flat)
+                    value = value_flat.reshape(batch_size, seq_length, -1)
 
-        # Handle past key/values for generation
-        if layer_past is not None:
-            past_key, past_value = layer_past
-            key = torch.cat((past_key, key), dim=1)
-            value = torch.cat((past_value, value), dim=1)
+                # Concatenate with past key/values
+                key = torch.cat((past_key, key), dim=1)
+                value = torch.cat((past_value, value), dim=1)
 
+        # Store current key/value for future calls
         present = (key, value) if use_cache else None
 
-        # Split heads
-        batch_size, seq_length = query.shape[:2]
-        head_dim = self.head_dim
-        n_head = self.num_heads
-
-        # Reshape for multi-head attention
-        query = query.view(batch_size, seq_length, n_head, head_dim).transpose(1, 2)
-        key = key.view(batch_size, -1, n_head, head_dim).transpose(1, 2)
-        value = value.view(batch_size, -1, n_head, head_dim).transpose(1, 2)
+        # Split heads - match original implementation exactly
+        query = self._split_heads(query, self.num_heads, self.head_dim)
+        key = self._split_heads(key, self.num_heads, self.head_dim)
+        value = self._split_heads(value, self.num_heads, self.head_dim)
 
         # Calculate attention
         attn_output, attn_weights = self._attn(query, key, value, attention_mask, head_mask)
 
-        # Reshape back
-        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_length, -1)
+        # Merge heads back
+        attn_output = self._merge_heads(attn_output, self.num_heads, self.head_dim)
 
-        # Project output back to original dimensions if needed
-        if self.embed_dim != self.orig_embed_dim:
-            if callable(self.backproject_fn):
-                attn_output = self.backproject_fn(attn_output)  # Project back to original dimension
-            else:
-                print("WARNING: Missing backproject_fn for compressed attention. Using identity.")
-                # We should never reach here in production; compressed attention requires backprojection
+        # Project back to original dimension if needed
+        if self.embed_dim != self.orig_embed_dim and callable(self.backproject_fn):
+            attn_output_flat = attn_output.reshape(-1, attn_output.size(-1))
+            attn_output_flat = self.backproject_fn(attn_output_flat)
+            attn_output = attn_output_flat.reshape(batch_size, seq_length, -1)
 
-        # Project output using original projection
+        # Final projection
         attn_output = self.original_attn.c_proj(attn_output)
 
-        # Return based on flags
+        # Ensure output has same dtype as input for numerical stability
+        attn_output = attn_output.to(dtype)
+
+        # Return outputs
         outputs = (attn_output, present)
         if output_attentions:
             outputs += (attn_weights,)
 
         return outputs
 
-    def _attn(self, q, k, v, attention_mask=None, head_mask=None):
-        # Get sequence length and batch size
-        bsz, num_heads, q_len, head_dim = q.size()
-        k_len = k.size(2)  # Could be different from q_len due to past_key
+    def _attn(self, query, key, value, attention_mask=None, head_mask=None):
+        # Get dimensions - note GPT-2's peculiar handling of dimensions
+        batch_size, num_heads, q_len, head_dim = query.size()
+        k_len = key.size(-2)
 
-        # Calculate attention scores
-        # (bsz, num_heads, q_len, k_len)
-        attn_weights = torch.matmul(q, k.transpose(-1, -2))
-        attn_weights = attn_weights / math.sqrt(head_dim)  # Scale using head_dim
+        # Compute attention scores - use exactly the same computation as GPT-2
+        # [batch, heads, q_len, head_dim] x [batch, heads, head_dim, k_len]
+        # -> [batch, heads, q_len, k_len]
+        attn_weights = torch.matmul(query, key.transpose(-1, -2))
 
-        # Apply causal mask if needed (for autoregressive generation)
-        if q_len > 1:
-            # PyTorch masking is done with -inf
-            causal_mask = torch.triu(
-                torch.ones((q_len, k_len), dtype=torch.bool, device=q.device),
-                diagonal=1
+        # Scale exactly as in GPT-2
+        attn_weights = attn_weights / math.sqrt(head_dim)
+
+        # Apply causal mask - use exactly same implementation as GPT-2
+        # Critical: Use -10000.0 instead of -inf for better numerical stability
+        if q_len > 1:  # No need for causal mask when generating single token
+            causal_mask = torch.tril(
+                torch.ones((q_len, k_len), dtype=attn_weights.dtype, device=attn_weights.device)
             )
-            attn_weights.masked_fill_(causal_mask.unsqueeze(0).unsqueeze(0), float('-inf'))
+            mask = causal_mask.view(1, 1, q_len, k_len)
+            attn_weights = attn_weights * mask + -10000.0 * (1.0 - mask)
 
-        # Apply attention mask if provided
+        # Apply attention mask if provided (for padded tokens)
         if attention_mask is not None:
-            # Add attention mask to scores
             attn_weights = attn_weights + attention_mask
 
-        # Apply softmax
+        # Standard softmax
         attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)
 
-        # Apply head mask if provided
+        # Ensure same dtype as inputs
+        attn_weights = attn_weights.type_as(value)
+
+        # Apply head mask (e.g., for pruning heads)
         if head_mask is not None:
             attn_weights = attn_weights * head_mask
 
         # Calculate context
-        attn_output = torch.matmul(attn_weights, v)
+        context = torch.matmul(attn_weights, value)
 
-        return attn_output, attn_weights
+        return context, attn_weights
 
 
 # Main function to apply sparsification to a model
